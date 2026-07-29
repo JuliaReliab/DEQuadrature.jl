@@ -1,4 +1,5 @@
-import DEQuadrature: _deint, deformulaZeroToInf, deformulaMinusOneToOne, deint
+import DEQuadrature: _deint, deformulaZeroToInf, deformulaMinusOneToOne,
+                     deformulaMinusInfToInf, deint
 using Test
 
 @testset "DEQuadrature.jl" begin
@@ -35,7 +36,6 @@ end
             0
         end
     end
-    println(result.x)
     @test result.s ≈ 10.0
 end
 
@@ -43,7 +43,6 @@ end
     result = deint(1.0, Inf64) do x
         1.0/sqrt(2.0*pi) * exp(-(x - 1.0)^2/2.0)
     end
-    println(result.x)
     @test result.s ≈ 0.5
 end
 
@@ -108,4 +107,106 @@ end
     end
     @test isfinite(result.s)
     @test result.s ≈ 0.0 atol=1e-8
+end
+
+# Regression tests
+
+@testset "InfiniteLowerBound" begin
+    # Used to return 0.0 silently: the -Inf lower bound fell through to the
+    # finite-interval branch, where d_half = Inf killed every weight.
+    result = deint(-Inf, 0.0) do x
+        exp(x)
+    end
+    @test result.s ≈ 1.0 rtol=1e-8
+    @test result.h * sum(result.w) ≈ result.s
+
+    result = deint(-Inf, 2.0) do x
+        exp(x)
+    end
+    @test result.s ≈ exp(2.0) rtol=1e-8
+    @test all(result.x .<= 2.0)
+end
+
+@testset "DoublyInfinite" begin
+    result = deint(-Inf, Inf) do x
+        exp(-x^2)
+    end
+    @test result.s ≈ sqrt(pi) rtol=1e-8
+    @test result.h * sum(result.w) ≈ result.s
+
+    result = deint(-Inf, Inf) do x
+        1.0 / (1.0 + x^2)
+    end
+    @test result.s ≈ pi rtol=1e-8
+
+    result = _deint(deformulaMinusInfToInf) do x
+        exp(-x^2)
+    end
+    @test result.s ≈ sqrt(pi) rtol=1e-8
+    @test issorted(result.t)
+end
+
+@testset "InvalidBounds" begin
+    @test_throws DomainError deint(x -> 1.0, Inf, Inf)
+    @test_throws DomainError deint(x -> 1.0, 0.0, -Inf)
+    @test_throws DomainError deint(x -> 1.0, NaN, 1.0)
+    @test_throws DomainError deint(x -> 1.0, 0.0, NaN)
+end
+
+@testset "SmallMagnitudeRelativeAccuracy" begin
+    # The relative test used to floor its denominator at 1, and the default
+    # node-dropping threshold was an absolute eps(T). Both turned the requested
+    # relative tolerance into an absolute one for small-valued integrals; the
+    # 1e-300 case returned exactly 0.0.
+    for scale in (1e-13, 1e-100, 1e-300)
+        result = deint(0.0, Inf64) do x
+            scale * exp(-x)
+        end
+        @test result.s ≈ scale rtol=1e-8
+    end
+end
+
+@testset "LargeMaxIterDoesNotOverAllocate" begin
+    # sizehint! used to reserve the maxiter worst case up front, so raising
+    # maxiter inflated memory by orders of magnitude without adding a node.
+    f = x -> 0.5*x^-0.5*exp(-x^0.5)
+    r12 = _deint(f, deformulaZeroToInf, maxiter=12)
+    r20 = _deint(f, deformulaZeroToInf, maxiter=20)
+    @test length(r12.x) == length(r20.x)
+    a12 = @allocated _deint(f, deformulaZeroToInf, maxiter=12)
+    a20 = @allocated _deint(f, deformulaZeroToInf, maxiter=20)
+    @test a20 < 2 * a12
+end
+
+@testset "DropzeroIsSeparateFromAbstol" begin
+    # abstol must not silently discard nodes any more.
+    exact = deint(x -> exp(-x), 0.0, Inf64)
+    loose = deint(x -> exp(-x), 0.0, Inf64, abstol=1e-3)
+    @test loose.s ≈ 1.0 rtol=1e-5
+    # dropzero is the knob that trades nodes for accuracy.
+    dropped = deint(x -> exp(-x), 0.0, Inf64, dropzero=1e-3)
+    @test isapprox(dropped.s, 1.0; rtol=1e-3)
+    @test all(abs.(dropped.w) .> 1e-3)
+end
+
+@testset "PromotedBounds" begin
+    @test deint(x -> exp(-x), 0, Inf).s ≈ 1.0 rtol=1e-8
+    @test deint(x -> 2x, 0, 1).s ≈ 1.0 rtol=1e-8
+    @test deint(x -> 1.0, 0, 10).s ≈ 10.0 rtol=1e-8
+end
+
+@testset "BigFloatDoublyInfinite" begin
+    setprecision(128) do
+        result = deint(BigFloat(-Inf), BigFloat(Inf); reltol=BigFloat(1e-20)) do x
+            exp(-x^2)
+        end
+        @test result.s ≈ sqrt(BigFloat(pi)) rtol=BigFloat(1e-18)
+    end
+end
+
+@testset "FormulaIsConcretelyTyped" begin
+    # Untyped phi/phidash fields made every node evaluation a dynamic dispatch.
+    F = deformulaZeroToInf
+    @test isconcretetype(fieldtype(typeof(F), :phi))
+    @test isconcretetype(fieldtype(typeof(F), :phidash))
 end
